@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Stezok/auto-ans/internal/timemanager"
@@ -12,18 +13,49 @@ import (
 )
 
 type Appeal struct {
-	id       int
-	username string
-	text     string
+	id        int
+	firstname string
+	lastname  string
+	username  string
+	text      string
 }
 
 type TelegramBot struct {
-	bot         *tgbotapi.BotAPI
-	TimeManager *timemanager.Manager
-	banList     []int
-	admin       int64
+	bot           *tgbotapi.BotAPI
+	TimeManager   *timemanager.Manager
+	target        int
+	banList       []int
+	cooldownTable map[int]struct{}
+	cooldownMu    sync.Mutex
+	admin         int64
 
 	closeChan chan struct{}
+}
+
+func (tgbot *TelegramBot) SetCooldown(id int, dur time.Duration) {
+	tgbot.cooldownMu.Lock()
+	defer tgbot.cooldownMu.Unlock()
+	tgbot.cooldownTable[id] = struct{}{}
+
+	go func() {
+		time.Sleep(dur)
+		tgbot.cooldownMu.Lock()
+		defer tgbot.cooldownMu.Unlock()
+		delete(tgbot.cooldownTable, id)
+	}()
+}
+
+func (tgbot *TelegramBot) IsOnCooldown(id int) bool {
+	tgbot.cooldownMu.Lock()
+	defer tgbot.cooldownMu.Unlock()
+	_, ok := tgbot.cooldownTable[id]
+	return ok
+}
+
+func (tgbot *TelegramBot) DeleteCooldown(id int) {
+	tgbot.cooldownMu.Lock()
+	defer tgbot.cooldownMu.Unlock()
+	delete(tgbot.cooldownTable, id)
 }
 
 func (tgbot *TelegramBot) IsBanned(id int) bool {
@@ -36,7 +68,7 @@ func (tgbot *TelegramBot) IsBanned(id int) bool {
 }
 
 func (tgbot *TelegramBot) NotifyAdmin(appeal Appeal) error {
-	text := fmt.Sprintf("Новое обращение от %s.\n\n%s", appeal.username, appeal.text)
+	text := fmt.Sprintf("Новое обращение от %s %s %d.\n\n%s", appeal.firstname, appeal.lastname, appeal.id, appeal.text)
 	mes := tgbotapi.NewMessage(tgbot.admin, text)
 
 	data := fmt.Sprintf("k%d", appeal.id)
@@ -48,6 +80,33 @@ func (tgbot *TelegramBot) NotifyAdmin(appeal Appeal) error {
 
 	_, err := tgbot.bot.Send(mes)
 	return err
+}
+
+func (tgbot *TelegramBot) NewTarget(id int) {
+	text := fmt.Sprintf("Текущий собеседник: %d", id)
+	mesConf := tgbotapi.NewMessage(tgbot.admin, text)
+	message, _ := tgbot.bot.Send(mesConf)
+
+	unpin := tgbotapi.UnpinChatMessageConfig{
+		ChatID: tgbot.admin,
+	}
+	tgbot.bot.Send(unpin)
+
+	pin := tgbotapi.PinChatMessageConfig{
+		ChatID:              tgbot.admin,
+		MessageID:           message.MessageID,
+		DisableNotification: true,
+	}
+	tgbot.bot.Send(pin)
+	tgbot.target = id
+}
+
+func (tgbot *TelegramBot) RemoveTarget() {
+	unpin := tgbotapi.UnpinChatMessageConfig{
+		ChatID: tgbot.admin,
+	}
+	tgbot.bot.Send(unpin)
+	tgbot.target = 0
 }
 
 func (tgbot *TelegramBot) handleCallback(update tgbotapi.Update) {
@@ -76,7 +135,7 @@ func (tgbot *TelegramBot) handleCallback(update tgbotapi.Update) {
 		if err != nil {
 			log.Print(err)
 		}
-
+		tgbot.NewTarget(idInt)
 		message := tgbotapi.NewMessage(int64(idInt), "Оператор присоединился к чату.")
 		_, err = tgbot.bot.Send(message)
 		if err != nil {
@@ -88,6 +147,7 @@ func (tgbot *TelegramBot) handleCallback(update tgbotapi.Update) {
 				tgbot.banList = append(tgbot.banList[:i], tgbot.banList[i+1:]...)
 			}
 		}
+		tgbot.DeleteCooldown(idInt)
 
 		messageID := update.CallbackQuery.Message.MessageID
 		chatID := update.CallbackQuery.Message.Chat.ID
@@ -96,12 +156,28 @@ func (tgbot *TelegramBot) handleCallback(update tgbotapi.Update) {
 		if err != nil {
 			log.Print(err)
 		}
-
+		tgbot.RemoveTarget()
 		message := tgbotapi.NewMessage(int64(idInt), "Оператор покинул чат.")
+
 		_, err = tgbot.bot.Send(message)
 		if err != nil {
 			log.Print(err)
 		}
+	}
+}
+
+func (tgbot *TelegramBot) handleCommand(update tgbotapi.Update) {
+	command := update.Message.Command()
+	if command == "target" && update.Message.From.ID == int(tgbot.admin) {
+		args := update.Message.CommandArguments()
+		if args == "" {
+			return
+		}
+		id, err := strconv.Atoi(args)
+		if err != nil {
+			return
+		}
+		tgbot.NewTarget(id)
 	}
 }
 
@@ -110,7 +186,24 @@ func (tgbot *TelegramBot) handle(update tgbotapi.Update) {
 		return
 	}
 
-	if tgbot.IsBanned(update.Message.From.ID) {
+	if tgbot.admin == update.Message.Chat.ID {
+		if tgbot.target != 0 {
+			mes := tgbotapi.NewMessage(int64(tgbot.target), update.Message.Text)
+			tgbot.bot.Send(mes)
+			return
+		}
+		return
+	}
+
+	if tgbot.target == update.Message.From.ID {
+		user := fmt.Sprintf("%s %s", update.Message.From.FirstName, update.Message.From.LastName)
+
+		mes := tgbotapi.NewMessage(tgbot.admin, "Клиент "+user+" : "+update.Message.Text)
+		tgbot.bot.Send(mes)
+		return
+	}
+
+	if tgbot.IsBanned(update.Message.From.ID) || tgbot.IsOnCooldown(update.Message.From.ID) {
 		return
 	}
 
@@ -126,11 +219,14 @@ func (tgbot *TelegramBot) handle(update tgbotapi.Update) {
 	if err != nil {
 		log.Print(err)
 	}
+	tgbot.SetCooldown(update.Message.From.ID, time.Hour)
 
 	err = tgbot.NotifyAdmin(Appeal{
-		id:       update.Message.From.ID,
-		username: update.Message.From.UserName,
-		text:     update.Message.Text,
+		id:        update.Message.From.ID,
+		firstname: update.Message.From.FirstName,
+		lastname:  update.Message.From.LastName,
+		username:  update.Message.From.UserName,
+		text:      update.Message.Text,
 	})
 
 	if err != nil {
@@ -142,8 +238,13 @@ func (tgbot *TelegramBot) Handle(updates tgbotapi.UpdatesChannel) {
 	for {
 		select {
 		case update := <-updates:
-			tgbot.handle(update)
-			tgbot.handleCallback(update)
+			if update.Message != nil && update.Message.Command() != "" {
+				tgbot.handleCommand(update)
+			} else {
+				tgbot.handle(update)
+				tgbot.handleCallback(update)
+			}
+
 		case <-tgbot.closeChan:
 			return
 		}
@@ -180,10 +281,11 @@ func NewTelegramBot(token string, timeManager *timemanager.Manager, admin int64)
 	}
 
 	return &TelegramBot{
-		bot:         bot,
-		TimeManager: timeManager,
-		admin:       admin,
-		closeChan:   make(chan struct{}, 1),
-		banList:     []int{me.ID},
+		bot:           bot,
+		TimeManager:   timeManager,
+		admin:         admin,
+		closeChan:     make(chan struct{}, 1),
+		banList:       []int{me.ID},
+		cooldownTable: make(map[int]struct{}),
 	}, nil
 }

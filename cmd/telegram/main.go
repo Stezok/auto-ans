@@ -17,6 +17,7 @@ func main() {
 	)
 
 	bot, err := telegram.NewTelegramBot("1797876808:AAFUeiOkIVr93hZvQ_0FSUjUXrS1rbJOwEQ", timeManager, 496823111)
+	// bot, err := telegram.NewTelegramBot("1057474366:AAGloprVxM9DP13UvgE75A5cBVyyJAf1M4s", timeManager, 768413750)
 	if err != nil {
 		log.Fatal(err)
 	}
